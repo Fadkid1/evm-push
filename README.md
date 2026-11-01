@@ -4,7 +4,6 @@ A private Telegram bot that trades tokens from **Kleos** (thekleos.xyz), **ElysP
 
 One private key, so one address, trades on both chains.
 
-## How each token is routed
 
 The bot finds which launchpad launched the token and trades it exactly the way that launchpad's own site does: the same contracts, the same calls, and the same endpoint for submitting.
 
