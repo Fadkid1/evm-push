@@ -29,19 +29,27 @@ export interface BatchResult {
   inboxTx?: Hex;
 }
 
-/** RPC endpoints a raw Elysium tx goes to, per launchpad (what each site does). */
+/**
+ * RPC endpoints a raw Elysium tx goes to, per launchpad. ElysPump and Stockium: what their sites do.
+ * Kleos: its relay plus the live RPC. It is the same signed tx to the same Kleos router, so it executes
+ * once, on whichever path is faster (the live feed takes ~1s; the relay waits for an inbox batch).
+ */
 const SUBMIT: Record<Exclude<Transport, "hyperevm">, string[]> = {
   elysp: [ELYSIUM_RPC.elysp],
   stockium: [ELYSIUM_RPC.stockium, ELYSIUM_RPC.elysp],
-  kleos: [ELYSIUM_RPC.kleos],
+  kleos: [ELYSIUM_RPC.elysp, ELYSIUM_RPC.kleos],
 };
-/** Where to look for receipts. */
+/** Where to look for receipts (all polled at once). */
 const RECEIPTS: Record<Transport, string[]> = {
-  elysp: [ELYSIUM_RPC.elysp],
+  elysp: [ELYSIUM_RPC.elysp, ELYSIUM_RPC.stockium],
   stockium: [ELYSIUM_RPC.stockium, ELYSIUM_RPC.elysp],
-  kleos: [ELYSIUM_RPC.kleos, ELYSIUM_RPC.elysp],
+  kleos: [ELYSIUM_RPC.elysp, ELYSIUM_RPC.stockium],
   hyperevm: HYPEREVM_RPCS,
 };
+/** Live-state endpoints for the nonce (the Kleos relay's count lags). */
+const NONCE_RPCS = [ELYSIUM_RPC.elysp, ELYSIUM_RPC.stockium];
+/** How long a Kleos trade may take on the live path before the bot also posts it to the inbox itself. */
+const KLEOS_LIVE_GRACE_MS = 6000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -76,6 +84,13 @@ export class Wallet {
     return (chainId === hyperEvm.id ? hyperClient : elyClient).getBalance({ address: this.address });
   }
 
+  /** Loads the Elysium nonce and gas price up front, so the first trade doesn't wait on them. */
+  async warm(): Promise<void> {
+    const n = await this.nextNonce(elysium.id).catch(() => undefined);
+    if (n !== undefined && !this.nonces.has(elysium.id)) this.nonces.set(elysium.id, n);
+    await this.gasPrice(elysium.id, "elysp").catch(() => {});
+  }
+
   /** Runs fn with this chain's nonce sequence locked, so concurrent trades never reuse a nonce. */
   private async locked<T>(chainId: number, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(chainId) ?? Promise.resolve();
@@ -84,12 +99,12 @@ export class Wallet {
     return run;
   }
 
-  private async nextNonce(chainId: number, transport: Transport): Promise<number> {
+  private async nextNonce(chainId: number): Promise<number> {
     const cached = this.nonces.get(chainId);
     if (cached !== undefined) return cached;
-    // Highest pending count any endpoint reports, as Stockium's site does.
-    const urls = chainId === hyperEvm.id ? HYPEREVM_RPCS : [...new Set([...SUBMIT[transport as keyof typeof SUBMIT], ELYSIUM_RPC.elysp, ELYSIUM_RPC.stockium, ELYSIUM_RPC.kleos])];
-    const counts = await Promise.all(urls.map((u) => rawRpc<Hex>(u, "eth_getTransactionCount", [this.address, "pending"]).then(Number).catch(() => -1)));
+    // Highest pending count the endpoints report, as Stockium's site does.
+    const urls = chainId === hyperEvm.id ? HYPEREVM_RPCS.slice(0, 2) : NONCE_RPCS;
+    const counts = await Promise.all(urls.map((u) => rawRpc<Hex>(u, "eth_getTransactionCount", [this.address, "pending"], 4000).then(Number).catch(() => -1)));
     const n = Math.max(...counts);
     if (n < 0) throw new Error("Couldn't read the wallet nonce from any RPC");
     return n;
@@ -98,7 +113,7 @@ export class Wallet {
   private async gasPrice(chainId: number, transport: Transport): Promise<bigint> {
     const key = `${chainId}:${transport}`;
     const hit = this.gasPrices.get(key);
-    if (hit && Date.now() - hit.at < 15_000) return hit.price;
+    if (hit && Date.now() - hit.at < 60_000) return hit.price;
     const base = await clientFor(transport).getGasPrice();
     // Elysium: 2x the node's price (Stockium's choice), HyperEVM: +25%.
     const price = chainId === hyperEvm.id ? (base * 125n) / 100n : base * 2n;
@@ -111,11 +126,19 @@ export class Wallet {
       await hyperClient.sendRawTransaction({ serializedTransaction: raw });
       return;
     }
-    const results = await Promise.allSettled(SUBMIT[transport].map((u) => rawRpc<Hex>(u, "eth_sendRawTransaction", [raw], 20_000)));
-    if (results.some((r) => r.status === "fulfilled")) return;
-    const msgs = results.map((r) => (r as PromiseRejectedResult).reason?.message ?? "").filter(Boolean);
-    if (msgs.some((m) => /already known|known transaction|already imported/i.test(m))) return;
-    throw new Error(msgs[0] ?? "transaction rejected");
+    // Done as soon as one endpoint accepts it; the others keep going in the background.
+    const sends = SUBMIT[transport].map((u) =>
+      rawRpc<Hex>(u, "eth_sendRawTransaction", [raw], 20_000).catch((e: Error) => {
+        if (/already known|known transaction|already imported/i.test(e.message)) return raw;
+        throw e;
+      }),
+    );
+    try {
+      await Promise.any(sends);
+    } catch (e) {
+      const errs = (e as AggregateError).errors ?? [];
+      throw new Error((errs[0] as Error | undefined)?.message ?? "transaction rejected");
+    }
   }
 
   /**
@@ -128,16 +151,19 @@ export class Wallet {
     }
     return this.locked(chainId, async () => {
       const client = clientFor(transport);
-      const [nonce0, gasPrice] = await Promise.all([this.nextNonce(chainId, transport), this.gasPrice(chainId, transport)]);
+      const estimate = (req: TxReq) =>
+        client.estimateGas({ account: this.address, to: req.to, data: req.data, value: req.value ?? 0n }).then((est) => (est * 13n) / 10n + 30_000n);
+      // The first tx's gas estimate runs alongside the nonce and gas-price lookups.
+      const [nonce0, gasPrice, firstGas] = await Promise.all([
+        this.nextNonce(chainId),
+        this.gasPrice(chainId, transport),
+        reqs[0] && reqs[0].gas === undefined ? estimate(reqs[0]) : Promise.resolve(undefined),
+      ]);
       const sent: Sent[] = [];
       let nonce = nonce0;
       try {
-        for (const req of reqs) {
-          let gas = req.gas;
-          if (gas === undefined) {
-            const est = await client.estimateGas({ account: this.address, to: req.to, data: req.data, value: req.value ?? 0n });
-            gas = (est * 13n) / 10n + 30_000n;
-          }
+        for (const [i, req] of reqs.entries()) {
+          const gas = req.gas ?? (i === 0 ? firstGas! : await estimate(req));
           const raw = await this.account.signTransaction({
             chainId,
             type: "legacy",
@@ -157,7 +183,7 @@ export class Wallet {
         // Something was rejected: forget the cached nonce so the next send re-reads it from the chain.
         this.nonces.delete(chainId);
         if (sent.length) this.nonces.set(chainId, nonce);
-        throw e;
+        throw Object.assign(e as Error, { sentCount: sent.length });
       }
       if (!this.dryRun) this.nonces.set(chainId, nonce);
       return sent;
@@ -166,30 +192,40 @@ export class Wallet {
 
   async receipt(transport: Transport, hash: Hex, timeoutMs: number): Promise<TransactionReceipt | null> {
     const end = Date.now() + timeoutMs;
-    const client = clientFor(transport);
     while (Date.now() < end) {
-      for (const u of RECEIPTS[transport]) {
-        const r = await rawRpc<Record<string, unknown> | null>(u, "eth_getTransactionReceipt", [hash]).catch(() => null);
-        if (r) return client.getTransactionReceipt({ hash }).catch(() => formatReceipt(r));
-      }
-      await sleep(transport === "hyperevm" ? 1500 : 700);
+      const rs = await Promise.all(RECEIPTS[transport].map((u) => rawRpc<Record<string, unknown> | null>(u, "eth_getTransactionReceipt", [hash], 4000).catch(() => null)));
+      const r = rs.find((x) => x);
+      if (r) return formatReceipt(r);
+      await sleep(transport === "hyperevm" ? 1000 : 250);
     }
     return null;
   }
 
   /**
-   * Sends a batch and waits for it. On the Kleos route this also posts the signed txs into the Elysium inbox
-   * from this wallet on HyperEVM (kleos_held -> sendL2Message), the fast path the Kleos site offers.
+   * Sends a batch and waits for it. On the Kleos route, if the live path hasn't confirmed within a few seconds,
+   * the signed txs are also posted into the Elysium inbox from this wallet on HyperEVM
+   * (kleos_held -> sendL2Message), the fast path the Kleos site offers.
    */
   async execute(chainId: number, transport: Transport, reqs: TxReq[]): Promise<BatchResult> {
-    const sent = await this.sendBatch(chainId, transport, reqs);
+    let sent: Sent[];
+    try {
+      sent = await this.sendBatch(chainId, transport, reqs);
+    } catch (e) {
+      // Another app using this wallet moved its nonce: sendBatch has dropped the cached one, so retry once.
+      if (!/nonce/i.test((e as Error).message) || (e as { sentCount?: number }).sentCount) throw e;
+      sent = await this.sendBatch(chainId, transport, reqs);
+    }
     if (this.dryRun) return { sent, receipts: [] };
     let inboxTx: Hex | undefined;
     let kleosNote: string | undefined;
     if (transport === "kleos") {
-      const posted = await this.postKleosHeld(sent.map((s) => s.hash)).catch((e: Error) => ({ note: e.message }));
-      if ("hash" in posted) inboxTx = posted.hash;
-      else kleosNote = posted.note;
+      const last = sent.at(-1)!.hash;
+      const live = await this.receipt(transport, last, KLEOS_LIVE_GRACE_MS);
+      if (!live) {
+        const posted = await this.postKleosHeld(sent.map((s) => s.hash)).catch((e: Error) => ({ note: e.message }));
+        if ("hash" in posted) inboxTx = posted.hash;
+        else kleosNote = posted.note;
+      }
     }
     const timeout = transport === "kleos" ? 240_000 : transport === "hyperevm" ? 90_000 : 60_000;
     const wait = (async () => {

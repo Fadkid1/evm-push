@@ -1,4 +1,4 @@
-import { createPublicClient, fallback, http, type Address, type Hex, type PublicClient } from "viem";
+import { createPublicClient, custom, fallback, http, type PublicClient } from "viem";
 import { ELYSIUM_RPC, HYPEREVM_RPCS, elysium, hyperEvm } from "../chains.js";
 import type { Transport } from "../venues/types.js";
 
@@ -10,28 +10,36 @@ export const hyperClient = createPublicClient({
   batch: { multicall: true },
 }) as PublicClient;
 
-/** Elysium reads through ElysPump's live RPC (live-feed state, the same state every pad trades on). */
+/**
+ * Sends each request to every endpoint at once and takes the first good answer. ElysPump's live RPC
+ * rate-limits under load and Stockium's serves the same live state, so racing them hides either one's spikes.
+ */
+const race = (urls: string[]) =>
+  custom({
+    async request({ method, params }) {
+      try {
+        return await Promise.any(urls.map((u) => rawRpc(u, method, (params as unknown[]) ?? [], 8000)));
+      } catch (e) {
+        throw (e as AggregateError).errors?.[0] ?? e;
+      }
+    },
+  });
+
+/** Elysium live-feed state (what every pad trades on), from ElysPump's and Stockium's live RPCs. */
 export const elyClient = createPublicClient({
   chain: elysium,
-  transport: fallback([http(ELYSIUM_RPC.elysp, opts), http(ELYSIUM_RPC.stockium, opts)]),
+  transport: race([ELYSIUM_RPC.elysp, ELYSIUM_RPC.stockium]),
   batch: { multicall: true },
 }) as PublicClient;
 
-/** Stockium's own RPC first, as its site reads. */
-export const stockiumClient = createPublicClient({
-  chain: elysium,
-  transport: fallback([http(ELYSIUM_RPC.stockium, opts), http(ELYSIUM_RPC.elysp, opts)]),
-  batch: { multicall: true },
-}) as PublicClient;
 
-/** The Kleos relay RPC: it also knows the transactions it is holding for the inbox. */
-export const kleosClient = createPublicClient({
-  chain: elysium,
-  transport: fallback([http(ELYSIUM_RPC.kleos, opts), http(ELYSIUM_RPC.elysp, opts)]),
-}) as PublicClient;
-
+/**
+ * Client for reading state (balances, allowances, quotes, gas estimates) on a venue's chain.
+ * Kleos reads use the live RPC too: the Kleos relay serves state that lags the live chain by minutes,
+ * which once made a sell use an already-spent balance. The relay is only used to submit Kleos trades.
+ */
 export function clientFor(t: Transport): PublicClient {
-  return t === "hyperevm" ? hyperClient : t === "kleos" ? kleosClient : t === "stockium" ? stockiumClient : elyClient;
+  return t === "hyperevm" ? hyperClient : elyClient;
 }
 
 export async function rawRpc<T>(url: string, method: string, params: unknown[], timeoutMs = 10_000): Promise<T> {
@@ -45,20 +53,4 @@ export async function rawRpc<T>(url: string, method: string, params: unknown[], 
   if (j.error) throw new Error(j.error.message ?? `${method} failed`);
   if (!res.ok) throw new Error(`${method}: HTTP ${res.status}`);
   return j.result as T;
-}
-
-/**
- * Kleos quotes run against the relay's queued state (kleos_queueCall), exactly as the Kleos site quotes,
- * so a quote already counts trades the relay is still holding. Falls back to a plain live-RPC call.
- */
-export async function kleosCall(to: Address, data: Hex): Promise<Hex> {
-  try {
-    const r = await rawRpc<Hex>(ELYSIUM_RPC.kleos, "kleos_queueCall", [{ to, data }]);
-    if (typeof r === "string" && r !== "0x") return r;
-  } catch (e) {
-    if (/revert/i.test((e as Error).message)) throw e;
-  }
-  const { data: out } = await elyClient.call({ to, data });
-  if (!out) throw new Error("the quote returned nothing");
-  return out;
 }

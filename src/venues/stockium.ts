@@ -1,12 +1,12 @@
 import { encodeFunctionData, type Address, type Hex } from "viem";
 import { elysium, hyperEvm } from "../chains.js";
-import { hyperClient, stockiumClient } from "../chain/clients.js";
+import { elyClient, hyperClient } from "../chain/clients.js";
 import { erc20Abi, gatewayRouterAbi, quoterV2Abi, stockiumCurveAbi, stockiumReceiverAbi, swapRouterAbi, v3FactoryAbi, v3PoolAbi } from "./abis.js";
 import { STOCKIUM } from "./addresses.js";
 import { approveTxs, encodePath, v3Spot } from "./v3.js";
 import { ZERO, type TxReq, type Venue } from "./types.js";
 
-const ely = stockiumClient;
+const ely = elyClient;
 const S = STOCKIUM;
 const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
@@ -44,14 +44,12 @@ export async function detectStockium(addr: Address): Promise<Venue | null> {
   }
   if (l1Pool) return stockiumSwap(await l2TokenOf(addr), l1Pool);
   if (direct) return stockiumSwap(addr, direct.pool);
-  // Paired with a hub or a stock token instead of WHYPE.
-  for (const hub of S.hubs) {
-    for (const fee of S.fees) {
-      const pool = await ely.readContract({ address: S.swapFactory, abi: v3FactoryAbi, functionName: "getPool", args: [addr, hub.pair, fee] }).catch(() => ZERO);
-      if (pool !== ZERO) return stockiumSwap(addr, pool);
-    }
-  }
-  return null;
+  // Paired with a hub instead of WHYPE.
+  const hubPools = await Promise.all(
+    S.hubs.flatMap((hub) => S.fees.map((fee) => ely.readContract({ address: S.swapFactory, abi: v3FactoryAbi, functionName: "getPool", args: [addr, hub.pair, fee] }).catch(() => ZERO))),
+  );
+  const hubPool = hubPools.find((p) => p !== ZERO);
+  return hubPool ? stockiumSwap(addr, hubPool) : null;
 }
 
 /** Elysium pool a graduated curve's HyperEVM token was listed in (the site's receivers poolOf lookup). */

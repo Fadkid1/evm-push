@@ -4,6 +4,7 @@ A private Telegram bot that trades tokens from **Kleos** (thekleos.xyz), **ElysP
 
 One private key, so one address, trades on both chains.
 
+## How each token is routed
 
 The bot finds which launchpad launched the token and trades it exactly the way that launchpad's own site does: the same contracts, the same calls, and the same endpoint for submitting.
 
@@ -17,12 +18,19 @@ The bot finds which launchpad launched the token and trades it exactly the way t
 | Stockium | Not graduated yet | The bonding curve's own `buy` / `sell` on HyperEVM |
 | Stockium | Graduated | StockiumSwap on Elysium: one hop for HYPE pairs, HYPE → hub → token for hub pairs |
 
-**Submission** follows each site too:
-- **Kleos:** signed for Elysium and sent to the Kleos relay (`rpc.thekleos.xyz/rpc`). The bot then posts the held transactions into the Elysium inbox on HyperEVM from your wallet (`sendL2Message`), which is the site's "send it now" path. This needs a little HYPE on HyperEVM for gas; without it the Kleos relay posts the trade later. Kleos trades run when the inbox message is read, so they confirm more slowly than ElysPump or Stockium trades.
+**Submission:**
+- **Kleos:** the signed trade goes to the Kleos relay (`rpc.thekleos.xyz/rpc`) and to the live Elysium RPC at the same time. It is the same signed transaction to the same Kleos router, so it executes once, on whichever path is faster. The live path takes about a second. If it hasn't confirmed within 6s, the bot also posts the trade into the Elysium inbox from your wallet on HyperEVM (`sendL2Message`, the Kleos site's "send it now" path). That needs a little HYPE on HyperEVM.
 - **ElysPump:** `rpc-live.elysp.com` (live execution).
 - **Stockium:** `rpc.stockium.fun` and `rpc-live.elysp.com` at once, which is what stockium.fun does.
 
-Quotes come from the same place each site quotes. Kleos quotes go through `kleos_queueCall`, so they count trades the relay is still holding.
+## Speed
+
+- Reads (balances, quotes) go to ElysPump's and Stockium's live RPCs at once and use the first answer. ElysPump's RPC rate-limits under load.
+- A pasted token's launchpad is checked on all three pads in parallel, then cached, so the buy and sell buttons skip it.
+- The nonce and gas price are loaded at startup. The quote, balance and metadata are fetched together. Elysium swaps use a fixed gas limit (as elysp.com does) instead of an estimate.
+- A trade is accepted as soon as one RPC takes it, and confirmations are polled every 250 ms on all live RPCs.
+
+Balances, quotes and gas estimates are always read from live state. The Kleos relay's own state lags the live chain by minutes, so it is used only for submitting.
 
 ## What the bot shows
 

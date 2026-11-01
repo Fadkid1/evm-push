@@ -146,18 +146,17 @@ export class Trader {
   /** Buys with an exact HYPE amount, straight away. */
   async buy(ref: string, hypeAmount: number, settings: Settings): Promise<TradeOutcome> {
     const v = await this.venue(ref);
-    const meta = await this.meta(v);
     const amountIn = toRaw(hypeAmount);
-    const bal = await this.wallet.balance(v.chainId);
+    // Metadata, balance and quote in one round trip.
+    const [meta, bal, expected] = await Promise.all([this.meta(v), this.wallet.balance(v.chainId), v.quoteBuy(amountIn)]);
     const reserve = GAS_RESERVE[v.chainId]!;
     if (bal < amountIn + reserve) {
       const where = v.chainId === elysium.id ? "on Elysium (bridge from HyperEVM on the home screen)" : "on HyperEVM";
       throw new Error(`Not enough HYPE ${where}: have ${fromRaw(bal).toFixed(4)}, need ${(hypeAmount + fromRaw(reserve)).toFixed(4)} incl. gas`);
     }
-    const expected = await v.quoteBuy(amountIn);
     if (expected <= 0n) throw new Error("The pool quoted 0 tokens for this amount");
     const minOut = applySlippage(expected, settings.slippagePct);
-    const reqs = v.buildBuy(amountIn, minOut, this.address, this.deadline(v));
+    const reqs = this.fixedGas(v, v.buildBuy(amountIn, minOut, this.address, this.deadline(v)));
     const out: TradeOutcome = { side: "buy", ok: true, venue: v, symbol: meta.symbol, hashes: [], hype: hypeAmount, tokens: fromRaw(expected, meta.decimals), estimated: true };
     if (this.wallet.dryRun) return { ...out, dryRun: reqs };
 
@@ -179,16 +178,13 @@ export class Trader {
   /** Sells a percentage of the holding, approving first when the route needs it (sent back to back, no waiting). */
   async sell(ref: string, pct: number, settings: Settings): Promise<TradeOutcome> {
     const v = await this.venue(ref);
-    const meta = await this.meta(v);
-    const balance = await this.tokenBalance(v);
+    const [meta, balance] = await Promise.all([this.meta(v), this.tokenBalance(v)]);
     const amount = percentOf(balance, pct);
     if (amount <= 0n) throw new Error(`No ${meta.symbol} to sell`);
-    const expected = await v.quoteSell(amount);
+    const [expected, approvals] = await Promise.all([v.quoteSell(amount), v.sellApprovals(this.address, amount)]);
     if (expected <= 0n) throw new Error(`The ${v.pad} route quotes 0 HYPE for this sell (no liquidity on its HYPE side); not selling`);
     const minOut = applySlippage(expected, settings.slippagePct);
-    const approvals = await v.sellApprovals(this.address, amount);
-    const sells = v.buildSell(amount, minOut, this.address, this.deadline(v)).map((r) => (approvals.length ? { ...r, gas: r.gas ?? GAS.swap } : r));
-    const reqs = [...approvals, ...sells];
+    const reqs = this.fixedGas(v, [...approvals, ...v.buildSell(amount, minOut, this.address, this.deadline(v))], approvals.length > 0);
     const out: TradeOutcome = { side: "sell", ok: true, venue: v, symbol: meta.symbol, hashes: [], hype: fromRaw(expected), tokens: fromRaw(amount, meta.decimals), estimated: true };
     if (this.wallet.dryRun) return { ...out, dryRun: reqs };
 
@@ -204,6 +200,16 @@ export class Trader {
       this.log(v, "sell", out);
     }
     return out;
+  }
+
+  /**
+   * Elysium swaps get a fixed gas limit (as elysp.com does), skipping the estimate round trip; gas there costs
+   * ~0.0003 HYPE at most. HyperEVM keeps estimates (large limits land in its slow big blocks), except behind
+   * an approval that hasn't executed yet.
+   */
+  private fixedGas(v: Venue, reqs: TxReq[], afterApproval = false): TxReq[] {
+    if (v.chainId !== elysium.id && !afterApproval) return reqs;
+    return reqs.map((r) => ({ ...r, gas: r.gas ?? GAS.swap }));
   }
 
   private fillFrom(out: TradeOutcome, res: BatchResult): void {

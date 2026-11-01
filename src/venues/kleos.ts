@@ -1,22 +1,24 @@
 import { decodeFunctionResult, encodeFunctionData, type Address, type Hex } from "viem";
 import { elysium } from "../chains.js";
-import { kleosCall, kleosClient } from "../chain/clients.js";
+import { elyClient } from "../chain/clients.js";
 import { erc20Abi, kleosLaunchpadAbi, kleosLauncherAbi, kleosRouterAbi, quoterV2Abi, swapRouterAbi, v3PoolAbi } from "./abis.js";
 import { KLEOS } from "./addresses.js";
 import { approveTxs } from "./v3.js";
 import { ZERO, type TxReq, type Venue } from "./types.js";
 
 const ZERO_ID = /^0x0+$/;
-const client = kleosClient;
+/** Reads use the live chain; the Kleos relay lags it (trades are still submitted through the relay). */
+const client = elyClient;
 
 type Call = { abi: readonly unknown[]; functionName: string; args?: unknown[]; data?: Hex };
 const enc = encodeFunctionData as unknown as (c: Call) => Hex;
 const dec = decodeFunctionResult as unknown as (c: Call) => unknown;
 
-/** A view call through kleos_queueCall, decoded. */
+/** A quote call against live state, decoded. */
 async function quoteCall<T>(abi: readonly unknown[], to: Address, functionName: string, args: unknown[]): Promise<T> {
-  const out = await kleosCall(to, enc({ abi, functionName, args }));
-  return dec({ abi, functionName, data: out }) as T;
+  const { data } = await client.call({ to, data: enc({ abi, functionName, args }) });
+  if (!data) throw new Error("the quote returned nothing");
+  return dec({ abi, functionName, data }) as T;
 }
 
 /** KLEOS price in HYPE, from whichever Kleos launchpad launched it (how the site prices KLEOS pairs). */

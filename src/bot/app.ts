@@ -5,6 +5,7 @@ import type { Db, Settings } from "../db.js";
 import { hypeUsd } from "../market.js";
 import type { Trader } from "../trader.js";
 import { parseInput } from "../venues/resolve.js";
+import { VERSION } from "../version.js";
 import { chainName, compact, esc, hype, pct, pnlEmoji, tokenCard, tradeResult, txLink, usd } from "./format.js";
 
 type Pending =
@@ -40,11 +41,15 @@ export function createBot(d: Deps): Bot {
   /** The live card message for each token, so a trade can replace it with a fresh one below. */
   const liveCards = new Map<number, number>();
 
-  // Only the admin can use the bot; everyone else is ignored.
-  bot.use(async (ctx, next) => {
+  // Only the admin can use the bot; everyone else is ignored. Each update is handled in the background,
+  // so a slow card or positions refresh never holds up the next tap (grammY handles updates one at a time).
+  bot.use((ctx, next) => {
     if (ctx.from?.id !== d.adminId) return;
-    await next();
+    void next().catch((e) => console.error("handler error:", e));
   });
+
+  /** Acknowledge a button tap. Never throws: Telegram rejects acks for taps older than ~15s. */
+  const ack = (ctx: Context, text?: string) => ctx.answerCallbackQuery(text ? { text } : undefined).catch(() => {});
 
   // ------------------------------------------------------------- views
 
@@ -85,7 +90,7 @@ export function createBot(d: Deps): Bot {
     const e = Number(ely) / 1e18;
     const h = Number(hyp) / 1e18;
     const text = [
-      `<b>HYPE Trading Bot</b>${d.dryRun ? " · <i>DRY RUN</i>" : ""}`,
+      `<b>HYPE Trading Bot</b> v${VERSION}${d.dryRun ? " · <i>DRY RUN</i>" : ""}`,
       `<code>${d.trader.address}</code>`,
       `🟣 Elysium: ${hype(e)} · ${usd(e * price)}`,
       `🔷 HyperEVM: ${hype(h)} · ${usd(h * price)}`,
@@ -144,13 +149,10 @@ export function createBot(d: Deps): Bot {
   function runTrade(ctx: Context, rid: number, label: string, fn: () => Promise<Parameters<typeof tradeResult>[0]>): void {
     const chatId = ctx.chat!.id;
     void (async () => {
+      // The trade starts at once; the status message is sent alongside it.
+      const trade = fn().then((o) => tradeResult(o), (e: unknown) => `❌ ${label}: ${errText(e)}`);
       const status = await bot.api.sendMessage(chatId, `⏳ ${label}…`, HTML);
-      try {
-        const o = await fn();
-        await bot.api.editMessageText(chatId, status.message_id, tradeResult(o), HTML);
-      } catch (e) {
-        await bot.api.editMessageText(chatId, status.message_id, `❌ ${label}: ${errText(e)}`, HTML).catch(() => {});
-      }
+      await bot.api.editMessageText(chatId, status.message_id, await trade, HTML).catch(() => {});
       const ref = d.db.ref(rid);
       if (ref) await postCard(chatId, ref).catch(() => {});
     })();
@@ -178,15 +180,21 @@ export function createBot(d: Deps): Bot {
     const [cmd, a, b] = data.split(":");
     const chat = ctx.chat!.id;
     try {
-      if (cmd === "home") return await (ctx.answerCallbackQuery(), home(ctx, true));
-      if (cmd === "pos") return await (ctx.answerCallbackQuery(), positions(ctx, true));
+      if (cmd === "home") {
+        void ack(ctx);
+        return await home(ctx, true);
+      }
+      if (cmd === "pos") {
+        void ack(ctx);
+        return await positions(ctx, true);
+      }
       if (cmd === "set" && !a) {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         const v = settingsView();
         return await ctx.editMessageText(v.text, { ...HTML, reply_markup: v.kb }).catch(ignoreNotModified);
       }
       if (cmd === "set") {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         const prompts: Record<string, [Pending, string]> = {
           buy: [{ kind: "setBuy" }, "Send the buy buttons in HYPE, comma separated (e.g. <code>0.1, 0.5, 1, 5</code>)."],
           sell: [{ kind: "setSell" }, "Send the sell buttons in %, comma separated (e.g. <code>25, 50, 100</code>)."],
@@ -199,7 +207,7 @@ export function createBot(d: Deps): Bot {
         return await ctx.reply(p[1], HTML);
       }
       if (cmd === "o") {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         const ref = d.db.ref(Number(a));
         if (!ref) return;
         if (b === "n") return await postCard(chat, ref);
@@ -210,12 +218,12 @@ export function createBot(d: Deps): Bot {
       }
       if (cmd === "b") {
         const amount = d.db.settings().buyPresets[Number(b)];
-        await ctx.answerCallbackQuery({ text: amount ? `Buying ${amount} HYPE` : "Unknown button" });
+        void ack(ctx, amount ? `Buying ${amount} HYPE` : "Unknown button");
         if (amount) buy(ctx, Number(a), amount);
         return;
       }
       if (cmd === "bx") {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         pending.set(chat, { kind: "buyX", rid: Number(a) });
         return await ctx.reply("How much HYPE to buy with? It buys as soon as you send it.");
       }
@@ -223,12 +231,12 @@ export function createBot(d: Deps): Bot {
         const rid = Number(a);
         const p = Number(b);
         const ref = d.db.ref(rid);
-        await ctx.answerCallbackQuery({ text: `Selling ${p}%` });
+        void ack(ctx, `Selling ${p}%`);
         if (ref) runTrade(ctx, rid, `Selling ${p}%`, () => d.trader.sell(ref, p, d.db.settings()));
         return;
       }
       if (cmd === "w") {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         const rid = Number(a);
         const ref = d.db.ref(rid);
         if (!ref) return;
@@ -237,19 +245,19 @@ export function createBot(d: Deps): Bot {
         return await ctx.reply(`Send the ${chainName(v.chainId)} address to withdraw this token to.`);
       }
       if (cmd === "wn") {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         const chainId = Number(a);
         pending.set(chat, { kind: "wdAddr", chainId, asset: "native" });
         return await ctx.reply(`Send the ${chainName(chainId)} address to withdraw HYPE to.`);
       }
       if (cmd === "br") {
-        await ctx.answerCallbackQuery();
+        void ack(ctx);
         pending.set(chat, { kind: "bridge" });
         return await ctx.reply("How much HYPE to move from HyperEVM to Elysium? (a number, or <code>max</code>). It's sent through the Elysium inbox right away.", HTML);
       }
-      await ctx.answerCallbackQuery();
+      void ack(ctx);
     } catch (e) {
-      await ctx.answerCallbackQuery().catch(() => {});
+      void ack(ctx);
       await ctx.reply(`❌ ${errText(e)}`, HTML);
     }
   });

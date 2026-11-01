@@ -34,21 +34,21 @@ const DETECT: Record<Pad, (a: Address) => Promise<Venue | null>> = {
 const ORDER: Pad[] = ["Kleos", "ElysPump", "Stockium"];
 
 const cache = new Map<string, { at: number; venue: Venue }>();
-const TTL = 60_000;
+/** A route only changes when a Stockium curve graduates, so only curves are re-checked often. */
+const ttl = (v: Venue) => (v.kind === "stockium-curve" ? 30_000 : 30 * 60_000);
 
-/** The token's launchpad and its original route. Cached briefly (a Stockium curve can graduate). */
+/** The token's launchpad and its original route. */
 export async function resolveVenue(input: ParsedInput): Promise<Venue | null> {
   const key = input.address.toLowerCase();
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < TTL) return hit.venue;
+  if (hit && Date.now() - hit.at < ttl(hit.venue)) return hit.venue;
   const order = input.hint ? [input.hint, ...ORDER.filter((p) => p !== input.hint)] : ORDER;
-  for (const pad of order) {
-    const v = await DETECT[pad](input.address).catch(() => null);
-    if (v) {
-      cache.set(key, { at: Date.now(), venue: v });
-      cache.set(v.token.toLowerCase(), { at: Date.now(), venue: v });
-      return v;
-    }
-  }
-  return null;
+  // All pads are checked at once; the first match in priority order wins, without waiting on the rest.
+  const checks = order.map((pad) => DETECT[pad](input.address).catch(() => null));
+  let v: Venue | null = null;
+  for (const c of checks) if ((v = await c)) break;
+  if (!v) return null;
+  cache.set(key, { at: Date.now(), venue: v });
+  cache.set(v.token.toLowerCase(), { at: Date.now(), venue: v });
+  return v;
 }
