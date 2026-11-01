@@ -1,0 +1,30 @@
+{
+  "name": "hype-trade-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "quote": "tsx scripts/dryQuote.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.9",
+    "grammy": "^1.46.0",
+    "viem": "^2.57.14"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  }
+}
